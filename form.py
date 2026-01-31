@@ -518,3 +518,10 @@ def main():
 if __name__ == "__main__":
     main()
 
+========
+
+batch_processing:
+  parallel_processing:
+    enabled: true       # Set to false to disable
+    max_workers: 20     # Adjust based on your machine/API limits
+
