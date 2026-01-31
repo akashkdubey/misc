@@ -214,3 +214,307 @@ class OutputFormatter:
             "Validation Log": "\n".join(formatted_validation),
             "Time (s)": f"{result.get('total_time', 0):.2f}"
         }
+
+
+===============================================================================================================================================================================
+
+
+"""
+Copy Block Generator CLI
+
+Provides commands for single keyword and batch processing of copy generation.
+Outputs both CSV and JSON formats with validation scores.
+"""
+
+import argparse
+import sys
+import logging
+import json
+import csv
+import time
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Any
+
+from .config import load_config, Strategies
+from .utils.logging import setup_logging
+from .core.workflow import CopyBlockWorkflow
+from .utils.mocks import apply_mocks
+
+logger = logging.getLogger(__name__)
+
+
+def _load_item_types(config: Dict[str, Any]) -> List[str]:
+    """Helper to load item types from config path."""
+    item_types = []
+    it_path = config.get('data_paths', {}).get('item_types')
+    if it_path:
+        path_obj = Path(it_path)
+        if path_obj.exists():
+            try:
+                with open(path_obj, 'r') as f:
+                    item_types = json.load(f)
+                logger.info(f"Loaded {len(item_types)} item types from {it_path}")
+            except Exception as e:
+                logger.warning(f"Failed to parse item types from {it_path}: {e}")
+        else:
+            logger.warning(f"Item types file not found at: {it_path}")
+    else:
+        logger.warning("No item_types path configured in data_paths")
+    return item_types
+
+
+def run_single_keyword(args):
+    """Run pipeline for a single keyword."""
+    config = load_config(args.config)
+    log_file, _ = setup_logging(args.log_dir)
+    
+    keyword = args.keyword
+    mode = args.mode
+    
+    logger.info(f"Processing keyword: {keyword} [Mode: {mode}]")
+    print(f"Processing keyword: {keyword} [Mode: {mode}]")
+    
+    if args.mock:
+        apply_mocks()
+        logger.info("Mock mode enabled")
+
+    # Load item types
+    item_types = _load_item_types(config)
+
+    # Run Workflow
+    workflow = CopyBlockWorkflow(config, mode=mode)
+    result = workflow.run(query=keyword, item_types=item_types)
+    
+    # Add metadata
+    result['timestamp'] = datetime.now().isoformat()
+    result['log_file'] = str(log_file)
+    
+    # Output to console
+    print(json.dumps(result, indent=2, default=str))
+    
+    # Save to files
+    output_dir = args.output_dir or "output"
+    from .utils.output_formatter import OutputFormatter
+    formatter = OutputFormatter(output_dir)
+    saved_paths = formatter.save_all(result)
+    
+    print(f"\n{'='*60}")
+    print("Output files saved:")
+    for fmt, path in saved_paths.items():
+        print(f"  {fmt.upper()}: {path}")
+    print(f"  LOG: {log_file}")
+    print(f"{'='*60}")
+    logger.info(f"Saved outputs to {output_dir}")
+
+
+def run_batch(args):
+    """Run pipeline for a batch of keywords with dual CSV/JSON output."""
+    config = load_config(args.config)
+    log_file, _ = setup_logging(args.log_dir)
+    
+    if args.mock:
+        apply_mocks()
+        logger.info("Mock mode enabled")
+    
+    # Read inputs
+    input_file = args.input_file
+    if not input_file:
+        input_file = config.get('batch_processing', {}).get('input_file')
+        if input_file:
+            logger.info(f"Using input file from config: {input_file}")
+            print(f"Using input file from config: {input_file}")
+            
+    if not input_file:
+        logger.error("No input file provided (args or config)")
+        print("Error: No input file provided. Please specify file or set batch_processing.input_file in conf.yml")
+        sys.exit(1)
+        
+    keywords = _read_keywords(str(input_file))
+    if not keywords:
+        logger.error("No keywords found in input file")
+        print("Error: No keywords found in input file")
+        sys.exit(1)
+    
+    # Load item types once
+    item_types = _load_item_types(config)
+    
+    logger.info(f"Starting batch processing for {len(keywords)} keywords [Mode: {args.mode}]")
+    print(f"Starting batch processing for {len(keywords)} keywords [Mode: {args.mode}]...")
+    
+    # Prepare output
+    output_dir = Path(args.output_dir or "output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    from .utils.output_formatter import OutputFormatter
+    formatter = OutputFormatter(str(output_dir))
+    
+    # Concurrency Config
+    batch_cfg = config.get('batch_processing', {})
+    parallel_cfg = batch_cfg.get('parallel_processing', {})
+    params = {
+        'use_parallel': parallel_cfg.get('enabled', False),
+        'max_workers': parallel_cfg.get('max_workers', 5)
+    }
+
+    full_results = []
+    start_time = time.time()
+    
+    try:
+        if params['use_parallel'] and len(keywords) > 1:
+            import concurrent.futures
+            print(f"🚀 Parallel mode enabled: {params['max_workers']} workers")
+            logger.info(f"Parallel mode enabled: {params['max_workers']} workers")
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=params['max_workers']) as executor:
+                # Submit all tasks
+                future_to_kw = {
+                    executor.submit(_process_batch_item, kw, config, args.mode, item_types, formatter): kw 
+                    for kw in keywords
+                }
+                
+                # Process as they complete
+                completed = 0
+                for future in concurrent.futures.as_completed(future_to_kw):
+                    kw = future_to_kw[future]
+                    completed += 1
+                    try:
+                        res = future.result()
+                        full_results.append(res)
+                        
+                        # Progress log
+                        score = res.get('validation', {}).get('overall_score', 0)
+                        status = "✅" if score > 0 else "❌"
+                        print(f"[{completed}/{len(keywords)}] {status} {kw} (Score: {score:.1f})")
+                        
+                    except Exception as e:
+                        logger.error(f"Worker failed for {kw}: {e}")
+                        
+        else:
+            # Sequential fallback
+            for i, kw in enumerate(keywords, 1):
+                print(f"[{i}/{len(keywords)}] Processing: {kw}")
+                res = _process_batch_item(kw, config, args.mode, item_types, formatter)
+                full_results.append(res)
+                
+    except KeyboardInterrupt:
+        print("\n⚠️ Batch interrupted by user. Saving partial results...")
+    
+    finally:
+        pass
+    
+    # Save batch report
+    print("\nGenerating batch report...")
+    batch_paths = formatter.save_batch_report(full_results)
+    
+    # Summary
+    total_time = time.time() - start_time
+    success_count = sum(1 for r in full_results if r.get('validation', {}).get('overall_score', 0) > 0)
+    
+    print(f"\n{'='*60}")
+    print(f"Batch complete: {success_count}/{len(keywords)} successful")
+    print(f"Total time: {total_time:.1f}s")
+    print(f"Batch Reports saved to:")
+    for type_, path in batch_paths.items():
+        print(f"  {type_.upper()}: {path}")
+    print(f"Log file: {log_file}")
+    print(f"{'='*60}")
+    
+    logger.info(f"Batch complete: {success_count}/{len(keywords)} successful in {total_time:.1f}s")
+
+
+def _process_batch_item(kw: str, config: Dict, mode: str, item_types: List[str], formatter: Any) -> Dict[str, Any]:
+    """Process a single keyword item for batch runner."""
+    try:
+        workflow = CopyBlockWorkflow(config, mode=mode)
+        res = workflow.run(query=kw, item_types=item_types)
+        
+        # Add metadata
+        res['timestamp'] = datetime.now().isoformat()
+        
+        # Save individual backup
+        formatter.save_all(res)
+        
+        return res
+        
+    except Exception as e:
+        logger.error(f"Failed {kw}: {e}", exc_info=True)
+        return {
+            "query": kw,
+            "mode": mode, 
+            "validation": {"overall_score": 0},
+            "fanout_output": {
+                "reasoning": f"FAILED: {str(e)}",
+                "rejected_fanouts": [{"query": "ALL", "reason": str(e)}]
+            }
+        }
+
+
+def _read_keywords(input_file: str) -> List[str]:
+    """Read keywords from CSV or TXT file."""
+    keywords = []
+    
+    if input_file.endswith('.csv'):
+        with open(input_file, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+            # Skip header if present
+            if rows and rows[0][0].lower() in ['keyword', 'query', 'main keyword']:
+                rows = rows[1:]
+            keywords = [r[0].strip() for r in rows if r and r[0].strip()]
+    else:
+        with open(input_file, 'r', encoding='utf-8') as f:
+            keywords = [line.strip() for line in f if line.strip()]
+    
+    return keywords
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="copy_gen",
+        description="Copy Block Generator CLI - Generate SEO copy from keywords"
+    )
+    parser.add_argument("--config", default="conf.yml", help="Path to config file")
+    parser.add_argument("--log-dir", default="logs", help="Log directory")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    # Run command (single keyword)
+    run_parser = subparsers.add_parser("run", help="Run generation for a single keyword")
+    run_parser.add_argument("keyword", help="Search keyword")
+    run_parser.add_argument("--mode", default=Strategies.V1, choices=Strategies.ALL,
+                           help="Generation strategy (v1=constrained, v2=unconstrained+filter)")
+    run_parser.add_argument("--output-dir", "-o", default="output",
+                           help="Output directory for JSON, CSV, and Excel files")
+    run_parser.add_argument("--mock", action="store_true", help="Mock API calls for testing")
+    run_parser.set_defaults(func=run_single_keyword)
+    
+    # Batch command
+    batch_parser = subparsers.add_parser("batch", help="Run batch generation from file")
+    batch_parser.add_argument("input_file", nargs="?", help="Input CSV/TXT file with keywords. Optional if configured in conf.yml")
+    batch_parser.add_argument("--output-dir", "-o", default="output",
+                             help="Output directory for results")
+    batch_parser.add_argument("--mode", default=Strategies.V1, choices=Strategies.ALL)
+    batch_parser.add_argument("--mock", action="store_true", help="Mock API calls for testing")
+    batch_parser.set_defaults(func=run_batch)
+    
+    args = parser.parse_args()
+    
+    # Set verbose logging if requested
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user")
+        sys.exit(130)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        print(f"Error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
